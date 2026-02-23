@@ -101,6 +101,9 @@ function createGameState() {
       confirmedHits: [],       // connected hits for the ship currently being targeted
       lastMove: null,          // { row, col, result } of the most recent AI attack
     },
+
+    // Tracks the AI setTimeout so it can be cancelled on restart
+    aiTimerId: null,
   };
 }
 
@@ -111,6 +114,11 @@ let gameState = createGameState();
  * Resets the game state back to initial values and re-renders everything.
  */
 function resetGameState() {
+  // Cancel any pending AI timer from the previous game
+  if (gameState.aiTimerId) {
+    clearTimeout(gameState.aiTimerId);
+  }
+
   gameState = createGameState();
   renderAll();
   updateStatus("Setup your game");
@@ -138,7 +146,7 @@ function canPlaceShip(board, length, startRow, startCol, isHorizontal) {
     const c = isHorizontal ? startCol + i : startCol;
 
     // Out of bounds
-    if (r >= BOARD_SIZE || c >= BOARD_SIZE) return false;
+    if (r < 0 || c < 0 || r >= BOARD_SIZE || c >= BOARD_SIZE) return false;
 
     // Overlaps an existing ship
     if (board[r][c] !== CELL_STATES.EMPTY) return false;
@@ -506,13 +514,15 @@ function handleRotateShip(shipIndex) {
   renderAll();
 }
 
-/** Enables or disables the Start Game button based on fleet completeness. */
+/** Enables or disables the Start Game button and Randomize button based on game phase. */
 function updateStartButton() {
   if (gameState.phase !== PHASES.SETUP) {
     dom.btnStart.disabled = true;
+    dom.btnRandomize.disabled = true;
     return;
   }
   dom.btnStart.disabled = gameState.playerShips.length < SHIP_DEFS.length;
+  dom.btnRandomize.disabled = false;
 }
 
 /**
@@ -736,12 +746,17 @@ function checkAllSunk(ships) {
  * @returns {{ result: "hit"|"miss", sunkShip: object|null }}
  */
 function resolveAttack(board, ships, row, col) {
+  // Guard: ignore attacks on cells that have already been resolved
+  if (board[row][col] === CELL_STATES.HIT || board[row][col] === CELL_STATES.MISS) {
+    return { result: board[row][col], sunkShip: null };
+  }
+
   if (board[row][col] === CELL_STATES.SHIP) {
     board[row][col] = CELL_STATES.HIT;
     const hitShip = ships.find((s) =>
       s.cells.some((c) => c.row === row && c.col === col)
     );
-    const justSunk = hitShip && checkShipSunk(board, hitShip);
+    const justSunk = hitShip && !hitShip.sunk && checkShipSunk(board, hitShip);
     return { result: "hit", sunkShip: justSunk ? hitShip : null };
   }
   board[row][col] = CELL_STATES.MISS;
@@ -910,7 +925,7 @@ function aiTurn() {
   gameState.currentTurn = "ai";
   updateStatus("Enemy is thinking...");
 
-  setTimeout(() => {
+  gameState.aiTimerId = setTimeout(() => {
     if (gameState.phase !== PHASES.PLAYING) return;
 
     const target = chooseAiMove();
