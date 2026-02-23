@@ -117,12 +117,36 @@ body {
 /* ===== BOARD GRID ===== */
 .board {
   display: grid;
-  grid-template-columns: repeat(10, var(--cell-size));
-  grid-template-rows: repeat(10, var(--cell-size));
+  grid-template-columns: auto repeat(10, var(--cell-size));
+  grid-template-rows: auto repeat(10, var(--cell-size));
   gap: var(--board-gap);
   background: var(--color-border);
   border: 2px solid var(--color-border);
   border-radius: 4px;
+}
+
+/* Board labels */
+.board__label {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  background: var(--color-bg);
+  user-select: none;
+}
+
+.board__label--corner {
+  background: var(--color-bg);
+}
+
+.board__label--col {
+  min-height: 20px;
+}
+
+.board__label--row {
+  min-width: 20px;
 }
 
 /* ===== CELLS ===== */
@@ -173,6 +197,16 @@ body {
 /* Player board hover during setup */
 #player-board .cell--ship {
   cursor: pointer;
+}
+
+/* Player board empty cells are drop targets during setup */
+#player-board .cell:not(.cell--ship):not(.cell--hit):not(.cell--miss) {
+  cursor: crosshair;
+}
+
+/* Subtle hover on player board empty cells during setup */
+#player-board .cell:not(.cell--ship):not(.cell--hit):not(.cell--miss):not(.cell--preview-valid):not(.cell--preview-invalid):hover {
+  background: #e2e8f0;
 }
 
 /* ===== SHIP BANK ===== */

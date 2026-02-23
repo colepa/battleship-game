@@ -97,6 +97,7 @@ let dragState = null;
 function resetGameState() {
   gameState = createGameState();
   dragState = null;
+  lastPreviewCell = null;
   renderAll();
   renderShipBank();
   updateStatus("Setup your game — drag ships onto your board or click Randomize");
@@ -165,6 +166,22 @@ function getShipCells(row, col, length, orientation) {
 }
 
 /**
+ * Returns ALL cells a ship would occupy (including out-of-bounds ones).
+ * Each cell has an `oob` flag indicating if it's outside the board.
+ * Used for preview rendering so users always see feedback near edges.
+ */
+function getShipCellsPartial(row, col, length, orientation) {
+  const cells = [];
+  for (let i = 0; i < length; i++) {
+    const r = orientation === "vertical" ? row + i : row;
+    const c = orientation === "horizontal" ? col + i : col;
+    const oob = r < 0 || r >= BOARD_SIZE || c < 0 || c >= BOARD_SIZE;
+    cells.push({ row: r, col: c, oob });
+  }
+  return cells;
+}
+
+/**
  * Randomly places all ships on a board.
  * @param {string[][]} board
  * @returns {object[]} Array of ship objects.
@@ -207,7 +224,25 @@ function renderBoard(boardEl, boardData, options = {}) {
 
   boardEl.innerHTML = "";
 
+  // Add column labels (A-J)
+  const cornerEl = document.createElement("div");
+  cornerEl.classList.add("board__label", "board__label--corner");
+  boardEl.appendChild(cornerEl);
+
+  for (let col = 0; col < BOARD_SIZE; col++) {
+    const colLabel = document.createElement("div");
+    colLabel.classList.add("board__label", "board__label--col");
+    colLabel.textContent = String.fromCharCode(65 + col); // A-J
+    boardEl.appendChild(colLabel);
+  }
+
   for (let row = 0; row < BOARD_SIZE; row++) {
+    // Add row label (1-10)
+    const rowLabel = document.createElement("div");
+    rowLabel.classList.add("board__label", "board__label--row");
+    rowLabel.textContent = row + 1;
+    boardEl.appendChild(rowLabel);
+
     for (let col = 0; col < BOARD_SIZE; col++) {
       const cell = document.createElement("div");
       cell.classList.add("cell");
@@ -232,16 +267,16 @@ function renderBoard(boardEl, boardData, options = {}) {
         cell.addEventListener("click", () => onCellClick(row, col));
       }
 
-      // Drag-and-drop targets on player board during setup
-      if (isPlayerBoard && gameState.phase === PHASES.SETUP) {
-        cell.addEventListener("dragover", handleDragOver);
-        cell.addEventListener("dragenter", handleDragEnter);
-        cell.addEventListener("dragleave", handleDragLeave);
-        cell.addEventListener("drop", handleDrop);
-      }
-
       boardEl.appendChild(cell);
     }
+  }
+
+  // Attach drag-and-drop at board level for player board during setup
+  if (isPlayerBoard && gameState.phase === PHASES.SETUP) {
+    boardEl.addEventListener("dragover", handleDragOver);
+    boardEl.addEventListener("dragenter", handleBoardDragEnter);
+    boardEl.addEventListener("dragleave", handleBoardDragLeave);
+    boardEl.addEventListener("drop", handleBoardDrop);
   }
 }
 
@@ -364,6 +399,7 @@ function renderShipBank() {
       shipEl.classList.remove("ship-bank__ship--dragging");
       clearPreview();
       dragState = null;
+      lastPreviewCell = null;
     });
 
     dom.shipBank.appendChild(shipEl);
@@ -412,17 +448,25 @@ function getAnchorFromTarget(targetRow, targetCol) {
   }
 }
 
+/** Track the last cell we showed a preview for, to avoid redundant updates. */
+let lastPreviewCell = null;
+
 function handleDragOver(e) {
   e.preventDefault();
   e.dataTransfer.dropEffect = "move";
-}
 
-function handleDragEnter(e) {
-  e.preventDefault();
+  // Update preview as user drags across cells (dragenter only fires at board level)
   if (!dragState) return;
 
-  const targetRow = parseInt(e.currentTarget.dataset.row);
-  const targetCol = parseInt(e.currentTarget.dataset.col);
+  const cell = getCellFromEvent(e);
+  if (!cell) return;
+
+  const cellKey = `${cell.dataset.row},${cell.dataset.col}`;
+  if (cellKey === lastPreviewCell) return; // same cell, skip
+  lastPreviewCell = cellKey;
+
+  const targetRow = parseInt(cell.dataset.row);
+  const targetCol = parseInt(cell.dataset.col);
   const anchor = getAnchorFromTarget(targetRow, targetCol);
   if (!anchor) return;
 
@@ -430,21 +474,63 @@ function handleDragEnter(e) {
   showPreview(anchor.row, anchor.col, shipDef.length, orientation);
 }
 
-function handleDragLeave(e) {
+/**
+ * Finds the board cell element from a drag event target (which may be
+ * the board itself, a cell, or a label).
+ */
+function getCellFromEvent(e) {
+  const el = document.elementFromPoint(e.clientX, e.clientY);
+  if (!el) return null;
+  const cell = el.closest(".cell");
+  if (!cell || !dom.playerBoard.contains(cell)) return null;
+  return cell;
+}
+
+function handleBoardDragEnter(e) {
+  e.preventDefault();
+  if (!dragState) return;
+
+  const cell = getCellFromEvent(e);
+  if (!cell) return;
+
+  const targetRow = parseInt(cell.dataset.row);
+  const targetCol = parseInt(cell.dataset.col);
+  const anchor = getAnchorFromTarget(targetRow, targetCol);
+  if (!anchor) return;
+
+  const { shipDef, orientation } = dragState;
+  showPreview(anchor.row, anchor.col, shipDef.length, orientation);
+}
+
+function handleBoardDragLeave(e) {
   const related = e.relatedTarget;
+  // Only clear preview when actually leaving the board entirely
   if (!related || !dom.playerBoard.contains(related)) {
     clearPreview();
   }
 }
 
-function handleDrop(e) {
+function handleBoardDrop(e) {
   e.preventDefault();
   if (!dragState) return;
 
-  const targetRow = parseInt(e.currentTarget.dataset.row);
-  const targetCol = parseInt(e.currentTarget.dataset.col);
+  const cell = getCellFromEvent(e);
+  if (!cell) {
+    updateStatus("Drop on a board cell to place your ship.");
+    clearPreview();
+    dragState = null;
+    return;
+  }
+
+  const targetRow = parseInt(cell.dataset.row);
+  const targetCol = parseInt(cell.dataset.col);
   const anchor = getAnchorFromTarget(targetRow, targetCol);
-  if (!anchor) return;
+  if (!anchor) {
+    updateStatus("Cannot place ship there — out of bounds!");
+    clearPreview();
+    dragState = null;
+    return;
+  }
 
   const { shipIndex, shipDef, orientation } = dragState;
 
@@ -485,20 +571,20 @@ function handleDrop(e) {
 
   clearPreview();
   dragState = null;
+  lastPreviewCell = null;
 }
 
 /**
  * Shows a placement preview (green/red) on the player board.
+ * Uses getShipCellsPartial so we always show feedback, even near edges.
  */
 function showPreview(row, col, length, orientation) {
   clearPreview();
-  const cells = getShipCells(row, col, length, orientation);
-  if (!cells) return;
-
+  const cells = getShipCellsPartial(row, col, length, orientation);
   const valid = canPlaceShip(gameState.playerBoard, row, col, length, orientation);
 
-  for (const { row: r, col: c } of cells) {
-    if (r < 0 || r >= BOARD_SIZE || c < 0 || c >= BOARD_SIZE) continue;
+  for (const { row: r, col: c, oob } of cells) {
+    if (oob) continue; // skip cells that are off the board
     const cellEl = dom.playerBoard.querySelector(
       `.cell[data-row="${r}"][data-col="${c}"]`
     );
