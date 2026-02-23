@@ -43,6 +43,10 @@ const dom = {
   btnRandomize: document.getElementById("btn-randomize"),
   btnStart: document.getElementById("btn-start"),
   btnRestart: document.getElementById("btn-restart"),
+  gameOverOverlay: document.getElementById("game-over-overlay"),
+  gameOverTitle: document.getElementById("game-over-title"),
+  gameOverSubtitle: document.getElementById("game-over-subtitle"),
+  gameOverBtn: document.getElementById("game-over-btn"),
 };
 
 /** Tracks state during an active drag-and-drop operation */
@@ -89,6 +93,14 @@ function createGameState() {
     enemyShips: [],
 
     moveLog: [],
+
+    // AI decision-making memory — resets each game
+    aiMemory: {
+      mode: "hunt",            // "hunt" (random) or "target" (finishing a ship)
+      candidateTargets: [],    // queued cells to try next (adjacent to hits)
+      confirmedHits: [],       // connected hits for the ship currently being targeted
+      lastMove: null,          // { row, col, result } of the most recent AI attack
+    },
   };
 }
 
@@ -247,6 +259,17 @@ function renderBoard(boardEl, boardData, options = {}) {
         // EMPTY — no extra class needed
       }
 
+      // Overlay a sunk indicator if this HIT cell belongs to a sunk ship
+      if (state === CELL_STATES.HIT && options.ships) {
+        const sunkShip = options.ships.find(
+          (s) => s.sunk && s.cells.some((c) => c.row === row && c.col === col)
+        );
+        if (sunkShip) {
+          cell.classList.remove("cell--hit");
+          cell.classList.add("cell--sunk");
+        }
+      }
+
       // Attach click listener if provided
       if (onCellClick) {
         cell.addEventListener("click", () => onCellClick(row, col));
@@ -265,12 +288,14 @@ function renderAll() {
   renderBoard(dom.playerBoard, gameState.playerBoard, {
     hideShips: false,
     onCellClick: handlePlayerBoardClick,
+    ships: gameState.playerShips,
   });
 
   // Enemy board: hide ships, allow attacks
   renderBoard(dom.enemyBoard, gameState.enemyBoard, {
     hideShips: true,
     onCellClick: handleEnemyBoardClick,
+    ships: gameState.enemyShips,
   });
 
   // Make placed ship cells draggable during setup
@@ -490,6 +515,48 @@ function updateStartButton() {
   dom.btnStart.disabled = gameState.playerShips.length < SHIP_DEFS.length;
 }
 
+/**
+ * Creates a custom drag image element that looks like a row/column of ship cells.
+ * Positions the grab offset so the cursor lines up with the grabbed cell.
+ * The element is appended off-screen and cleaned up after the drag frame.
+ */
+function setCustomDragImage(e, shipLength, grabOffset, isHorizontal) {
+  const cellPx = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--cell-size')) || 36;
+  const gapPx  = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--board-gap'))  || 2;
+
+  const ghost = document.createElement('div');
+  ghost.style.display = 'flex';
+  ghost.style.flexDirection = isHorizontal ? 'row' : 'column';
+  ghost.style.gap = gapPx + 'px';
+  ghost.style.position = 'absolute';
+  ghost.style.top = '-1000px';
+  ghost.style.left = '-1000px';
+  ghost.style.pointerEvents = 'none';
+
+  for (let i = 0; i < shipLength; i++) {
+    const cell = document.createElement('div');
+    cell.style.width  = cellPx + 'px';
+    cell.style.height = cellPx + 'px';
+    cell.style.background = 'var(--color-cell-ship)';
+    cell.style.borderRadius = '2px';
+    cell.style.opacity = '0.85';
+    ghost.appendChild(cell);
+  }
+
+  document.body.appendChild(ghost);
+
+  // Offset so the cursor sits in the center of the grabbed cell
+  const offsetMain = grabOffset * (cellPx + gapPx) + cellPx / 2;
+  const offsetCross = cellPx / 2;
+  const offsetX = isHorizontal ? offsetMain : offsetCross;
+  const offsetY = isHorizontal ? offsetCross : offsetMain;
+
+  e.dataTransfer.setDragImage(ghost, offsetX, offsetY);
+
+  // Remove the ghost element after the browser captures it
+  requestAnimationFrame(() => ghost.remove());
+}
+
 /** Sets up drag-and-drop event listeners (called once during init). */
 function initDragAndDrop() {
   // Ship bank: dragstart
@@ -515,6 +582,7 @@ function initDragAndDrop() {
     };
 
     e.dataTransfer.effectAllowed = "move";
+    setCustomDragImage(e, def.length, grabOffset, true);
   });
 
   // Player board: dragstart (pick up a placed ship to reposition)
@@ -554,6 +622,7 @@ function initDragAndDrop() {
     gameState.playerShips.splice(shipIndex, 1);
 
     e.dataTransfer.effectAllowed = "move";
+    setCustomDragImage(e, ship.length, grabOffset, ship.isHorizontal);
 
     // Visually update cells without full re-render (preserves drag ghost)
     ship.cells.forEach((c) => {
@@ -620,6 +689,269 @@ function initDragAndDrop() {
 }
 
 // =============================================================================
+// ATTACK RESOLUTION
+// =============================================================================
+
+/**
+ * Converts row/col to a human-readable label like "A1", "B5", etc.
+ * @param {number} row
+ * @param {number} col
+ * @returns {string}
+ */
+function coordLabel(row, col) {
+  return String.fromCharCode(65 + row) + (col + 1);
+}
+
+/**
+ * Checks whether a specific ship has been sunk (all cells are HIT).
+ * If so, marks the ship's `sunk` property.
+ * @param {string[][]} board
+ * @param {{ cells: {row:number,col:number}[], sunk: boolean }} ship
+ * @returns {boolean}
+ */
+function checkShipSunk(board, ship) {
+  if (ship.sunk) return true;
+  const isSunk = ship.cells.every((c) => board[c.row][c.col] === CELL_STATES.HIT);
+  if (isSunk) ship.sunk = true;
+  return isSunk;
+}
+
+/**
+ * Returns true when every ship in the fleet has been sunk.
+ * @param {{ sunk: boolean }[]} ships
+ * @returns {boolean}
+ */
+function checkAllSunk(ships) {
+  return ships.length > 0 && ships.every((s) => s.sunk);
+}
+
+/**
+ * Resolves an attack on a board cell.
+ * Mutates the board to HIT or MISS and returns the result.
+ *
+ * @param {string[][]} board   - Target board.
+ * @param {{ cells: {row:number,col:number}[], sunk: boolean }[]} ships - Fleet on that board.
+ * @param {number} row
+ * @param {number} col
+ * @returns {{ result: "hit"|"miss", sunkShip: object|null }}
+ */
+function resolveAttack(board, ships, row, col) {
+  if (board[row][col] === CELL_STATES.SHIP) {
+    board[row][col] = CELL_STATES.HIT;
+    const hitShip = ships.find((s) =>
+      s.cells.some((c) => c.row === row && c.col === col)
+    );
+    const justSunk = hitShip && checkShipSunk(board, hitShip);
+    return { result: "hit", sunkShip: justSunk ? hitShip : null };
+  }
+  board[row][col] = CELL_STATES.MISS;
+  return { result: "miss", sunkShip: null };
+}
+
+// =============================================================================
+// AI TURN — HUNT / TARGET LOGIC
+// =============================================================================
+
+/**
+ * Returns true if (row, col) is inside the board and has not been attacked yet.
+ */
+function isValidAiTarget(row, col) {
+  if (row < 0 || row >= BOARD_SIZE || col < 0 || col >= BOARD_SIZE) return false;
+  const state = gameState.playerBoard[row][col];
+  return state !== CELL_STATES.HIT && state !== CELL_STATES.MISS;
+}
+
+/**
+ * Returns the four cardinal neighbours of (row, col) that are valid targets.
+ * Filters out already-attacked and out-of-bounds cells.
+ */
+function getValidAdjacentCells(row, col) {
+  const directions = [
+    { row: row - 1, col },  // up
+    { row: row + 1, col },  // down
+    { row, col: col - 1 },  // left
+    { row, col: col + 1 },  // right
+  ];
+  return directions.filter((d) => isValidAiTarget(d.row, d.col));
+}
+
+/**
+ * Given 2+ connected hits, returns only the cells that continue the line
+ * in the detected direction (horizontal or vertical).
+ * Falls back to all valid neighbours if direction can't be determined.
+ */
+function getDirectionalCandidates(confirmedHits) {
+  if (confirmedHits.length < 2) return [];
+
+  // Determine orientation from the first two hits
+  const isHorizontal = confirmedHits[0].row === confirmedHits[1].row;
+
+  // Sort hits along the line so we can extend from both ends
+  const sorted = [...confirmedHits].sort((a, b) =>
+    isHorizontal ? a.col - b.col : a.row - b.row
+  );
+
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1];
+
+  // Extend in both directions along the line
+  const candidates = [];
+  if (isHorizontal) {
+    candidates.push({ row: first.row, col: first.col - 1 }); // extend left
+    candidates.push({ row: last.row, col: last.col + 1 });    // extend right
+  } else {
+    candidates.push({ row: first.row - 1, col: first.col }); // extend up
+    candidates.push({ row: last.row + 1, col: last.col });    // extend down
+  }
+
+  return candidates.filter((c) => isValidAiTarget(c.row, c.col));
+}
+
+/**
+ * Picks the next cell for the AI to attack.
+ *
+ * Hunt mode:  random untargeted cell.
+ * Target mode: pull from candidateTargets queue, skipping stale entries.
+ *              If the queue is empty, fall back to hunt mode.
+ */
+function chooseAiMove() {
+  const mem = gameState.aiMemory;
+
+  // --- Target mode: try candidates first ---
+  if (mem.mode === "target") {
+    // Prefer directional candidates when we have 2+ hits in a line
+    if (mem.confirmedHits.length >= 2) {
+      const directional = getDirectionalCandidates(mem.confirmedHits);
+      if (directional.length > 0) {
+        return directional[0];
+      }
+    }
+
+    // Otherwise drain the general candidate queue, skipping stale cells
+    while (mem.candidateTargets.length > 0) {
+      const next = mem.candidateTargets.shift();
+      if (isValidAiTarget(next.row, next.col)) {
+        return next;
+      }
+      // Cell was already attacked or invalid — skip and try the next one
+    }
+
+    // Queue exhausted without a usable target — fall back to hunt mode
+    mem.mode = "hunt";
+  }
+
+  // --- Hunt mode: pick a random untargeted cell ---
+  const available = [];
+  for (let r = 0; r < BOARD_SIZE; r++) {
+    for (let c = 0; c < BOARD_SIZE; c++) {
+      if (isValidAiTarget(r, c)) {
+        available.push({ row: r, col: c });
+      }
+    }
+  }
+  if (available.length === 0) return null;
+  return available[Math.floor(Math.random() * available.length)];
+}
+
+/**
+ * Updates the AI's memory after an attack resolves.
+ *
+ * On HIT:  record the hit, queue adjacent cells, enter target mode.
+ * On MISS: nothing special (candidates may still be queued).
+ * On SUNK: clear targeting data and return to hunt mode.
+ */
+function updateAiTargetingState(row, col, result, sunkShip) {
+  const mem = gameState.aiMemory;
+  mem.lastMove = { row, col, result };
+
+  if (result === "hit") {
+    mem.confirmedHits.push({ row, col });
+    mem.mode = "target";
+
+    // Queue adjacent cells that haven't been attacked yet
+    const adjacents = getValidAdjacentCells(row, col);
+    for (const adj of adjacents) {
+      // Avoid duplicate entries in the queue
+      const alreadyQueued = mem.candidateTargets.some(
+        (c) => c.row === adj.row && c.col === adj.col
+      );
+      if (!alreadyQueued) {
+        mem.candidateTargets.push(adj);
+      }
+    }
+  }
+
+  // Ship sunk — clear all targeting data and go back to hunting
+  if (sunkShip) {
+    resetAiTargeting();
+  }
+}
+
+/**
+ * Clears the AI's targeting memory so it returns to hunt mode.
+ * Called when a ship is sunk or the game restarts.
+ */
+function resetAiTargeting() {
+  const mem = gameState.aiMemory;
+  mem.mode = "hunt";
+  mem.candidateTargets = [];
+  mem.confirmedHits = [];
+  mem.lastMove = null;
+}
+
+/**
+ * Executes the AI's turn after a short delay.
+ * Uses hunt/target logic to pick the best cell, attacks it,
+ * updates the UI / move log, then hands the turn back to the player.
+ */
+function aiTurn() {
+  if (gameState.phase !== PHASES.PLAYING) return;
+
+  gameState.currentTurn = "ai";
+  updateStatus("Enemy is thinking...");
+
+  setTimeout(() => {
+    if (gameState.phase !== PHASES.PLAYING) return;
+
+    const target = chooseAiMove();
+    if (!target) return; // no cells left (shouldn't happen normally)
+
+    const { result, sunkShip } = resolveAttack(
+      gameState.playerBoard,
+      gameState.playerShips,
+      target.row,
+      target.col
+    );
+
+    // Update AI memory with the outcome
+    updateAiTargetingState(target.row, target.col, result, sunkShip);
+
+    // Log the result
+    const label = coordLabel(target.row, target.col);
+    if (result === "hit") {
+      const sunkMsg = sunkShip ? " and sunk your ship!" : "";
+      addLogEntry(`Enemy attacks ${label} — HIT${sunkMsg}`);
+    } else {
+      addLogEntry(`Enemy attacks ${label} — MISS`);
+    }
+
+    // Check if AI won
+    if (checkAllSunk(gameState.playerShips)) {
+      gameState.phase = PHASES.GAME_OVER;
+      updateStatus("You lost! All your ships have been sunk.");
+      addLogEntry("Game over — you lost.");
+      renderAll();
+      showGameOverOverlay(false);
+      return;
+    }
+
+    gameState.currentTurn = "player";
+    updateStatus("Your turn! Click an enemy cell to attack.");
+    renderAll();
+  }, 800);
+}
+
+// =============================================================================
 // EVENT HANDLERS
 // =============================================================================
 
@@ -663,10 +995,35 @@ function handleEnemyBoardClick(row, col) {
     return;
   }
 
-  // TODO: Resolve attack (check for ship, mark hit/miss, check sunk/win)
-  console.log(`Attack enemy at: (${row}, ${col})`);
-  addLogEntry(`Player attacks (${row}, ${col})`);
-  updateStatus("Attack registered — resolve logic TODO");
+  const { result, sunkShip } = resolveAttack(
+    gameState.enemyBoard,
+    gameState.enemyShips,
+    row,
+    col
+  );
+
+  const label = coordLabel(row, col);
+  if (result === "hit") {
+    const sunkMsg = sunkShip ? " and sunk a ship!" : "";
+    addLogEntry(`You attack ${label} — HIT${sunkMsg}`);
+    updateStatus(`HIT at ${label}!${sunkMsg}`);
+  } else {
+    addLogEntry(`You attack ${label} — MISS`);
+    updateStatus(`Miss at ${label}.`);
+  }
+
+  // Check if player won
+  if (checkAllSunk(gameState.enemyShips)) {
+    gameState.phase = PHASES.GAME_OVER;
+    updateStatus("You win! All enemy ships have been sunk!");
+    addLogEntry("Game over — you win!");
+    renderAll();
+    showGameOverOverlay(true);
+    return;
+  }
+
+  renderAll();
+  aiTurn();
 }
 
 /** Randomizes ship placement on the player board and marks all bank ships as placed. */
@@ -710,8 +1067,37 @@ function handleStartGame() {
   console.log("Game started");
 }
 
+/**
+ * Shows the game-over overlay with win or lose messaging.
+ * @param {boolean} playerWon
+ */
+function showGameOverOverlay(playerWon) {
+  const title = dom.gameOverTitle;
+  const subtitle = dom.gameOverSubtitle;
+  const btn = dom.gameOverBtn;
+
+  title.textContent = playerWon ? "Victory!" : "Defeat";
+  title.className = "game-over-overlay__title " +
+    (playerWon ? "game-over-overlay__title--win" : "game-over-overlay__title--lose");
+
+  subtitle.textContent = playerWon
+    ? "You sunk the entire enemy fleet!"
+    : "All your ships have been destroyed.";
+
+  btn.className = "game-over-overlay__btn " +
+    (playerWon ? "game-over-overlay__btn--win" : "game-over-overlay__btn--lose");
+
+  dom.gameOverOverlay.classList.add("game-over-overlay--visible");
+}
+
+/** Hides the game-over overlay. */
+function hideGameOverOverlay() {
+  dom.gameOverOverlay.classList.remove("game-over-overlay--visible");
+}
+
 /** Resets everything back to initial state. */
 function handleRestart() {
+  hideGameOverOverlay();
   resetGameState();
   console.log("Game restarted");
 }
@@ -725,6 +1111,8 @@ function init() {
   dom.btnRandomize.addEventListener("click", handleRandomize);
   dom.btnStart.addEventListener("click", handleStartGame);
   dom.btnRestart.addEventListener("click", handleRestart);
+
+  dom.gameOverBtn.addEventListener("click", handleRestart);
 
   initDragAndDrop();
   renderAll();
