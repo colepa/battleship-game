@@ -156,10 +156,122 @@ body {
   background: var(--color-cell-preview);
 }
 
+.cell--preview-valid {
+  background: var(--color-cell-preview);
+}
+
+.cell--preview-invalid {
+  background: #feb2b2;
+}
+
 /* Hover effect — only on enemy board cells that haven't been acted on */
 #enemy-board .cell:not(.cell--hit):not(.cell--miss):not(.cell--disabled):hover {
   background: var(--color-cell-preview);
   cursor: crosshair;
+}
+
+/* Player board hover during setup */
+#player-board .cell--ship {
+  cursor: pointer;
+}
+
+/* ===== SHIP BANK ===== */
+.ship-bank-container {
+  width: 100%;
+  max-width: 760px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1.5rem;
+}
+
+.ship-bank-container__title {
+  font-size: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.ship-bank-container__hint {
+  font-weight: normal;
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+}
+
+.ship-bank {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.ship-bank__ship {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  background: var(--color-bg);
+  border: 2px solid var(--color-border);
+  border-radius: 6px;
+  cursor: grab;
+  transition: opacity 0.2s, border-color 0.2s, transform 0.1s;
+  user-select: none;
+}
+
+.ship-bank__ship:hover:not(.ship-bank__ship--placed) {
+  border-color: var(--color-primary);
+}
+
+.ship-bank__ship:active:not(.ship-bank__ship--placed) {
+  cursor: grabbing;
+  transform: scale(1.02);
+}
+
+.ship-bank__ship--placed {
+  opacity: 0.35;
+  cursor: default;
+  border-style: dashed;
+}
+
+.ship-bank__ship--dragging {
+  opacity: 0.4;
+}
+
+.ship-bank__label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  min-width: 70px;
+  color: var(--color-text);
+}
+
+.ship-bank__cells {
+  display: flex;
+  gap: 2px;
+}
+
+.ship-bank__cells--vertical {
+  flex-direction: column;
+}
+
+.ship-bank__cell {
+  width: 22px;
+  height: 22px;
+  background: var(--color-cell-ship);
+  border-radius: 2px;
+}
+
+.ship-bank__rotate-btn {
+  font-size: 0.7rem;
+  padding: 0.2rem 0.4rem;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-surface);
+  cursor: pointer;
+  color: var(--color-text-muted);
+  transition: background 0.15s;
+}
+
+.ship-bank__rotate-btn:hover {
+  background: var(--color-bg);
+  color: var(--color-text);
 }
 
 /* ===== INFO PANEL ===== */
