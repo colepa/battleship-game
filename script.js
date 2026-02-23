@@ -89,16 +89,28 @@ function createGameState() {
     enemyShips: [],
 
     moveLog: [],
+
+    // AI targeting state (hunt/target mode)
+    aiCandidates: [],   // queued cells to try after a hit
+    aiAttacked: new Set(), // tracks "row,col" strings already attacked
   };
 }
 
 /** The single source of truth for the current game. */
 let gameState = createGameState();
 
+/** Tracks pending AI turn timeout so it can be cancelled on restart. */
+let aiTimeoutId = null;
+
 /**
  * Resets the game state back to initial values and re-renders everything.
  */
 function resetGameState() {
+  // Cancel any pending AI turn
+  if (aiTimeoutId !== null) {
+    clearTimeout(aiTimeoutId);
+    aiTimeoutId = null;
+  }
   gameState = createGameState();
   renderAll();
   updateStatus("Setup your game");
@@ -126,7 +138,7 @@ function canPlaceShip(board, length, startRow, startCol, isHorizontal) {
     const c = isHorizontal ? startCol + i : startCol;
 
     // Out of bounds
-    if (r >= BOARD_SIZE || c >= BOARD_SIZE) return false;
+    if (r < 0 || c < 0 || r >= BOARD_SIZE || c >= BOARD_SIZE) return false;
 
     // Overlaps an existing ship
     if (board[r][c] !== CELL_STATES.EMPTY) return false;
@@ -164,34 +176,53 @@ function placeShip(board, length, startRow, startCol, isHorizontal) {
  * @returns {{ length: number, cells: {row: number, col: number}[], sunk: false }[]}
  */
 function placeAllShipsRandomly(board) {
-  const ships = [];
+  const maxBoardRetries = 10;
 
-  for (let i = 0; i < SHIP_DEFS.length; i++) {
-    const shipLength = SHIP_DEFS[i].length;
-    let placed = false;
-    let attempts = 0;
-    const maxAttempts = 200;
-
-    while (!placed && attempts < maxAttempts) {
-      attempts++;
-      const isHorizontal = Math.random() < 0.5;
-      const startRow = Math.floor(Math.random() * BOARD_SIZE);
-      const startCol = Math.floor(Math.random() * BOARD_SIZE);
-
-      if (canPlaceShip(board, shipLength, startRow, startCol, isHorizontal)) {
-        const ship = placeShip(board, shipLength, startRow, startCol, isHorizontal);
-        ship.id = i;
-        ships.push(ship);
-        placed = true;
+  for (let retry = 0; retry < maxBoardRetries; retry++) {
+    // Clear board for each full retry
+    for (let r = 0; r < BOARD_SIZE; r++) {
+      for (let c = 0; c < BOARD_SIZE; c++) {
+        board[r][c] = CELL_STATES.EMPTY;
       }
     }
 
-    if (!placed) {
-      console.error(`Failed to place ship of length ${shipLength} after ${maxAttempts} attempts.`);
+    const ships = [];
+    let allPlaced = true;
+
+    for (let i = 0; i < SHIP_DEFS.length; i++) {
+      const shipLength = SHIP_DEFS[i].length;
+      let placed = false;
+      let attempts = 0;
+      const maxAttempts = 200;
+
+      while (!placed && attempts < maxAttempts) {
+        attempts++;
+        const isHorizontal = Math.random() < 0.5;
+        const startRow = Math.floor(Math.random() * BOARD_SIZE);
+        const startCol = Math.floor(Math.random() * BOARD_SIZE);
+
+        if (canPlaceShip(board, shipLength, startRow, startCol, isHorizontal)) {
+          const ship = placeShip(board, shipLength, startRow, startCol, isHorizontal);
+          ship.id = i;
+          ships.push(ship);
+          placed = true;
+        }
+      }
+
+      if (!placed) {
+        allPlaced = false;
+        break; // restart entire board
+      }
+    }
+
+    if (allPlaced) {
+      return ships;
     }
   }
 
-  return ships;
+  // Fallback: should never reach here on a 10x10 board
+  console.error("Failed to place all ships after multiple board retries.");
+  return [];
 }
 
 /**
@@ -620,6 +651,183 @@ function initDragAndDrop() {
 }
 
 // =============================================================================
+// ATTACK RESOLUTION, SUNK / WIN DETECTION
+// =============================================================================
+
+/**
+ * Checks whether every cell of a ship has been hit.
+ * If so, marks ship.sunk = true and returns true (exactly once per ship).
+ *
+ * @param {string[][]} board - The board the ship sits on.
+ * @param {{ cells: {row:number,col:number}[], sunk: boolean }} ship
+ * @returns {boolean} true if the ship just became sunk.
+ */
+function checkSunk(board, ship) {
+  if (ship.sunk) return false;
+  const isSunk = ship.cells.every(({ row, col }) => board[row][col] === CELL_STATES.HIT);
+  if (isSunk) {
+    ship.sunk = true;
+  }
+  return isSunk;
+}
+
+/**
+ * Returns true when every ship in the fleet has been sunk.
+ * @param {{ sunk: boolean }[]} ships
+ * @returns {boolean}
+ */
+function checkWin(ships) {
+  return ships.length > 0 && ships.every((s) => s.sunk);
+}
+
+/**
+ * Resolves a single attack on a board cell.
+ * Updates board state, logs the move, checks sunk/win, and triggers turn switch.
+ *
+ * @param {"player"|"ai"} attacker - Who is attacking.
+ * @param {string[][]} board - The target board (enemyBoard or playerBoard).
+ * @param {object[]} ships - The target ship array.
+ * @param {number} row
+ * @param {number} col
+ */
+function resolveAttack(attacker, board, ships, row, col) {
+  const isPlayer = attacker === "player";
+  const cellState = board[row][col];
+  const coordLabel = `(${row}, ${col})`;
+  const who = isPlayer ? "Player" : "AI";
+
+  if (cellState === CELL_STATES.SHIP) {
+    // HIT
+    board[row][col] = CELL_STATES.HIT;
+    addLogEntry(`${who} attacks ${coordLabel} — HIT!`);
+
+    // Check if any ship was just sunk
+    const sunkShip = ships.find((s) => !s.sunk && s.cells.some((c) => c.row === row && c.col === col));
+    if (sunkShip && checkSunk(board, sunkShip)) {
+      const shipDef = SHIP_DEFS[sunkShip.id];
+      const shipName = shipDef ? shipDef.name : `ship (len ${sunkShip.length})`;
+      addLogEntry(`${who} sunk the ${shipName}!`);
+      updateStatus(`${who} sunk the ${shipName}!`);
+    } else {
+      updateStatus(`${who} hit at ${coordLabel}!`);
+    }
+
+    // Update AI targeting memory on its own hits
+    if (!isPlayer) {
+      enqueueAiCandidates(row, col);
+    }
+  } else {
+    // MISS
+    board[row][col] = CELL_STATES.MISS;
+    addLogEntry(`${who} attacks ${coordLabel} — miss.`);
+    updateStatus(`${who} missed at ${coordLabel}.`);
+
+    // If AI missed, drop back to hunt mode by clearing candidates for the
+    // current chain (simple strategy: keep remaining candidates so adjacent
+    // cells of earlier hits are still tried).
+  }
+
+  renderAll();
+
+  // Check win
+  if (checkWin(ships)) {
+    const winner = isPlayer ? "Player" : "AI";
+    gameState.phase = PHASES.GAME_OVER;
+    updateStatus(`${winner} wins! All ships sunk. Press Restart to play again.`);
+    addLogEntry(`=== ${winner} wins! ===`);
+    renderAll();
+    return;
+  }
+
+  // Switch turns
+  if (isPlayer) {
+    gameState.currentTurn = "ai";
+    updateStatus("AI is thinking...");
+    aiTimeoutId = setTimeout(() => {
+      aiTimeoutId = null;
+      aiTakeTurn();
+    }, 600);
+  } else {
+    gameState.currentTurn = "player";
+    updateStatus("Your turn! Click an enemy cell to attack.");
+  }
+}
+
+// =============================================================================
+// AI LOGIC (hunt / target mode)
+// =============================================================================
+
+/**
+ * Picks a cell and fires. Uses target-mode candidates first (adjacent cells
+ * of previous hits), falling back to random hunt-mode.
+ */
+function aiTakeTurn() {
+  if (gameState.phase !== PHASES.PLAYING) return;
+
+  let row, col;
+
+  // Target mode: try queued candidates
+  while (gameState.aiCandidates.length > 0) {
+    const candidate = gameState.aiCandidates.shift();
+    const key = `${candidate.row},${candidate.col}`;
+    if (
+      candidate.row >= 0 && candidate.row < BOARD_SIZE &&
+      candidate.col >= 0 && candidate.col < BOARD_SIZE &&
+      !gameState.aiAttacked.has(key)
+    ) {
+      row = candidate.row;
+      col = candidate.col;
+      break;
+    }
+  }
+
+  // Hunt mode: pick a random un-attacked cell
+  if (row === undefined) {
+    const available = [];
+    for (let r = 0; r < BOARD_SIZE; r++) {
+      for (let c = 0; c < BOARD_SIZE; c++) {
+        if (!gameState.aiAttacked.has(`${r},${c}`)) {
+          available.push({ row: r, col: c });
+        }
+      }
+    }
+    if (available.length === 0) return; // no cells left (shouldn't happen)
+    const pick = available[Math.floor(Math.random() * available.length)];
+    row = pick.row;
+    col = pick.col;
+  }
+
+  gameState.aiAttacked.add(`${row},${col}`);
+  resolveAttack("ai", gameState.playerBoard, gameState.playerShips, row, col);
+}
+
+/**
+ * After an AI hit, enqueue the four orthogonal neighbours as target candidates.
+ * Skips cells already attacked.
+ */
+function enqueueAiCandidates(row, col) {
+  const directions = [
+    { row: row - 1, col },
+    { row: row + 1, col },
+    { row, col: col - 1 },
+    { row, col: col + 1 },
+  ];
+  for (const d of directions) {
+    const key = `${d.row},${d.col}`;
+    if (
+      d.row >= 0 && d.row < BOARD_SIZE &&
+      d.col >= 0 && d.col < BOARD_SIZE &&
+      !gameState.aiAttacked.has(key)
+    ) {
+      // Avoid duplicate entries
+      if (!gameState.aiCandidates.some((c) => c.row === d.row && c.col === d.col)) {
+        gameState.aiCandidates.push(d);
+      }
+    }
+  }
+}
+
+// =============================================================================
 // EVENT HANDLERS
 // =============================================================================
 
@@ -641,7 +849,7 @@ function handlePlayerBoardClick(row, col) {
 
 /**
  * Called when a cell on the enemy board is clicked.
- * Will resolve attacks once gameplay is implemented.
+ * Validates the click and resolves the player's attack.
  */
 function handleEnemyBoardClick(row, col) {
   if (!gameState.isGameStarted) {
@@ -663,10 +871,8 @@ function handleEnemyBoardClick(row, col) {
     return;
   }
 
-  // TODO: Resolve attack (check for ship, mark hit/miss, check sunk/win)
-  console.log(`Attack enemy at: (${row}, ${col})`);
-  addLogEntry(`Player attacks (${row}, ${col})`);
-  updateStatus("Attack registered — resolve logic TODO");
+  // Resolve the attack
+  resolveAttack("player", gameState.enemyBoard, gameState.enemyShips, row, col);
 }
 
 /** Randomizes ship placement on the player board and marks all bank ships as placed. */
