@@ -13,7 +13,7 @@
     <p id="status-text" class="header__status">Setup your game</p>
     <div class="header__controls">
       <button id="btn-randomize" class="btn">Randomize Ships</button>
-      <button id="btn-start" class="btn btn--primary">Start Game</button>
+      <button id="btn-start" class="btn btn--primary" disabled>Start Game</button>
       <button id="btn-restart" class="btn btn--danger">Restart</button>
     </div>
   </header>
@@ -32,6 +32,12 @@
       <div id="enemy-board" class="board"></div>
     </section>
   </main>
+
+  <!-- ===== SHIP BANK ===== -->
+  <section class="ship-bank-container">
+    <h3 class="ship-bank-container__label">Ship Bank <span class="ship-bank-container__hint">(drag to place, click placed ship to rotate)</span></h3>
+    <div id="ship-bank" class="ship-bank"></div>
+  </section>
 
   <!-- ===== INFO PANEL ===== -->
   <aside class="info-panel">
